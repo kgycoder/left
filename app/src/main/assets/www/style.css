@@ -4135,7 +4135,7 @@ body.maximized {
         color 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94),
         font-size 0.35s cubic-bezier(0.25, 0.46, 0.45, 0.94),
         filter 0.45s cubic-bezier(0.25, 0.46, 0.45, 0.94) !important;
-    will-change: color, font-size, filter !important;
+    /* will-change 제거: 가사 줄 수백 개가 각각 레이어로 승격되어 GPU 메모리·합성 비용이 시간이 지날수록 누적된다 */
     -webkit-font-smoothing: antialiased !important;
     user-select: none !important;
     -webkit-user-select: none !important;
@@ -4222,7 +4222,6 @@ button, a, div, span, input {
     transition:
         color 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94),
         filter 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94) !important;
-    will-change: color, filter !important;
     user-select: none !important;
     -webkit-user-select: none !important;
 }
@@ -4283,17 +4282,17 @@ button, a, div, span, input {
         transparent 100%) !important;
 }
 
-/* 2. 가사 폰트 크기 + 굵기 (최종 override) */
+/* 2. 가사 폰트 크기 + 굵기 (최종 override — Apple Music 스타일: 더 굵고 조금 더 크게) */
 .np-lyric-line,
 .np-lyric-line.prev,
 .np-lyric-line.near {
-    font-size: 17px !important;
-    font-weight: 700 !important;
+    font-size: 18.5px !important;
+    font-weight: 800 !important;
 }
 
 .np-lyric-line.active {
-    font-size: 17px !important;
-    font-weight: 800 !important;   /* 핵심: 700 → 800 */
+    font-size: 18.5px !important;
+    font-weight: 900 !important;
     color: rgba(255, 255, 255, 0.97) !important;
     filter: drop-shadow(0 0 14px rgba(255,255,255,0.14)) !important;
 }
@@ -5053,12 +5052,12 @@ button, a, div, span, input {
 .np-lyric-line {
     /* 가사 하이라이팅(색상)은 LRC 타임라인에 맞춰 "즉시" 반영되어야 하므로
        이동 애니메이션과 별개로 매우 짧게만 페이드한다.
-       (위치 이동은 여기서 건드리지 않음 — JS 스프링이 transform을 직접 구동) */
+       (위치 이동은 여기서 건드리지 않음 — JS 스프링이 transform을 직접 구동)
+       (will-change 없음: 줄마다 레이어 승격은 장시간 재생 시 합성 비용/발열의 원인) */
     transition:
         color 0.08s linear,
         opacity 0.08s linear,
         filter 0.08s linear !important;
-    will-change: color, opacity, filter;
 }
 
 .np-ls-lyric-line {
@@ -5237,7 +5236,7 @@ button, a, div, span, input {
 /* 기존 .np-lyric-line 폰트/색상/블러 전환을 그대로 물려받고,
    Lyrics View 전용 크기/줄간격만 재정의 (더 크고, 줄 사이 여백도 넉넉하게) */
 .np-lyric-line.np-lv-line {
-    font-size: 25px !important;
+    font-size: 27px !important;
     line-height: 1.4 !important;
     padding: 0 !important;
 }
@@ -5295,6 +5294,60 @@ button, a, div, span, input {
     .np-lv-inner { transition: none !important; }
 }
 
+
+/* ════════════════════════════════════════════════════════
+   WORD-SYNC (Apple Music 실시간 단어 하이라이팅)
+   각 글자(.lyl)의 채움/상승/글로우는 CSS 변수 --p(0→1)만으로 결정된다.
+   JS 는 --p 만 갱신하므로 스타일 전체 재기록이 없고, 시간이 지나도 비용이
+   늘지 않는다 (FPS/발열 최적화).
+   - 글자 내부를 빛이 흐르듯 채우는 그라디언트 클립(background-clip:text)
+   - 채워짐에 따라 한 글자씩 살짝 들어올리는 미세 모션
+   - .gl(오래 머무는 구간): 채움 진행에 따라 점진적 글로우
+   - 지나간 줄(.past/.prev)은 CSS 만으로 채워진 상태 유지 (JS 개입 없음)
+════════════════════════════════════════════════════════ */
+.lyw {
+    white-space: nowrap;          /* 단어 안에서 줄바꿈 금지 */
+}
+.lyl {
+    display: inline-block;
+    white-space: pre;
+    color: transparent !important;
+    background-image: linear-gradient(90deg,
+        rgba(255, 255, 255, var(--lw, 0.22)) 0 44%,
+        rgba(255, 255, 255, var(--ld, 0.22)) 56% 100%);
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    background-position: calc((1 - var(--p, 0)) * 100%) 0;
+    -webkit-background-clip: text;
+    background-clip: text;
+    transform: translateY(calc((1 - var(--p, 0)) * 1.5px));
+    transition: transform 0.22s cubic-bezier(0.33, 0, 0.2, 1);
+}
+.lyl.gl {
+    /* 채움과 함께 점진적으로 나타나는 글로우 (긴 구간 정지 단어) */
+    text-shadow:
+        0 0 calc(3px + var(--p, 0) * 12px) rgba(255, 255, 255, calc(var(--p, 0) * 0.26));
+}
+/* 줄 상태별 채움 유지/밝기 — past·prev(지나간 줄)는 채워진 채 유지 */
+.np-lyric-line.prev .lyl,
+.np-lyric-line.past .lyl,
+.np-lv-line-wrap.prev .lyl,
+.np-lv-line-wrap.past .lyl,
+.np-ls-lyric-line.ls-prev .lyl,
+.np-ls-lyric-line.past .lyl {
+    --p: 1;
+}
+.np-lyric-line .lyl { --lw: 0.22; --ld: 0.22; }
+.np-lyric-line.active .lyl,
+.np-lv-line-wrap.active .lyl { --lw: 0.97; --ld: 0.32; }
+.np-lyric-line.prev .lyl,
+.np-lv-line-wrap.prev .lyl { --lw: 0.5; --ld: 0.3; }
+.np-lyric-line.near .lyl,
+.np-lv-line-wrap.near .lyl { --lw: 0.36; --ld: 0.24; }
+
+@media (prefers-reduced-motion: reduce) {
+    .lyl { transition: none !important; }
+}
 
 /* ════════════════════════════════════════════════════════
    LIQUID GLASS (NATIVE) — Kyant0/AndroidLiquidGlass (Compose + backdrop)

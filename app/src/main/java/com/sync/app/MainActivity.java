@@ -694,7 +694,11 @@ public class MainActivity extends AppCompatActivity {
         String id       = msg.optString("id", "0");
 
         JSONArray lines = tryLrclib(rawTitle, channel, dur);
-        if (lines == null) lines = tryNetEase(rawTitle, channel, dur);
+        // word-level(단어 동기화) 가사 우선: 기본 lrc 와 함께 찾되, 단어 동기화가 있으면 그것을 사용
+        if (!hasWords(lines)) {
+            JSONArray alt = tryNetEase(rawTitle, channel, dur);
+            if (alt != null && (lines == null || hasWords(alt))) lines = alt;
+        }
 
         try {
             JSONObject result = new JSONObject();
@@ -712,6 +716,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ════════════════════════════════════════════════════
+    private boolean hasWords(JSONArray lines) {
+        if (lines == null || lines.length() == 0) return false;
+        try { return lines.getJSONObject(0).has("words"); }
+        catch (JSONException e) { return false; }
+    }
+
     //  1차: lrclib.net — PC 버전 C# 동일 알고리즘 포팅
     // ════════════════════════════════════════════════════
     private JSONArray tryLrclib(String rawTitle, String channel, double ytDur) {
@@ -741,6 +751,7 @@ public class MainActivity extends AppCompatActivity {
 
             // ── 후보 채점 (PC 버전 동일 가중치) ──
             String bestLrc   = null;
+            JSONObject bestItem = null;
             double bestScore = Double.NEGATIVE_INFINITY;
 
             for (int i = 0; i < results.length(); i++) {
@@ -767,8 +778,15 @@ public class MainActivity extends AppCompatActivity {
                 score += titleSim(ca, item.optString("artistName", "")) * 20;
                 // syncedLyrics 있으면 보너스
                 if (!item.optString("syncedLyrics", "").isEmpty()) score += 10;
+                // word-sync(Lyricsfile YAML) 있으면 우선 보너스
+                if (item.optBoolean("hasWordSync", false)) score += 15;
 
-                if (score > bestScore) { bestScore = score; bestLrc = lrcText; }
+                if (score > bestScore) { bestScore = score; bestLrc = lrcText; bestItem = item; }
+            }
+            // 단어 동기화 우선: LRCLIB lyricsfile(YAML, word-level) 사용
+            if (bestItem != null && bestItem.optBoolean("hasWordSync", false)) {
+                JSONArray w = parseLyricsfile(bestItem.optString("lyricsfile", ""));
+                if (w != null && w.length() > 0) return w;
             }
             return bestLrc != null ? parseLrc(bestLrc) : null;
         } catch (Exception e) { return null; }
@@ -890,7 +908,7 @@ public class MainActivity extends AppCompatActivity {
     private JSONArray fetchNetEaseLrc(long songId) {
         try {
             String url = "https://music.163.com/api/song/lyric?id="
-                    + songId + "&lv=1&kv=1&tv=-1";
+                    + songId + "&lv=1&kv=1&tv=-1&yv=1";
             Request req = new Request.Builder().url(url)
                     .addHeader("Referer", "https://music.163.com")
                     .addHeader("Cookie",  "appver=8.0.0")
@@ -898,6 +916,15 @@ public class MainActivity extends AppCompatActivity {
             try (Response resp = http.newCall(req).execute()) {
                 if (resp.body() == null) return null;
                 JSONObject doc = new JSONObject(readUtf8(resp));
+                // word-level(逐字) YRC 우선
+                JSONObject yrcObj = doc.optJSONObject("yrc");
+                if (yrcObj != null) {
+                    String yrc = yrcObj.optString("lyric", "");
+                    if (!yrc.isEmpty()) {
+                        JSONArray w = parseYrc(yrc);
+                        if (w != null && w.length() > 0) return w;
+                    }
+                }
                 String lrc = null;
                 if (doc.has("klyric"))
                     lrc = doc.getJSONObject("klyric").optString("lyric", null);
@@ -920,9 +947,27 @@ public class MainActivity extends AppCompatActivity {
     private static final Pattern TS_RX = Pattern.compile(
             "\\[(\\d+):(\\d{2})[.:](\\d{2,3})\\]");
 
+    private static final Pattern WTAG_RX = Pattern.compile("<(\\d+):(\\d{2})[.:](\\d{2,3})>");
+    private static final Pattern YRC_LINE_RX = Pattern.compile("^\\[(\\d+),(\\d+)\\]");
+    private static final Pattern YRC_WORD_RX = Pattern.compile("\\((\\d+),(\\d+),\\d+\\)(.*?)(?=\\(\\d+,\\d+,\\d+\\)|$)");
+
+    /** 파싱된 가사 한 줄 (단어 동기화 정보 선택) */
+    private static final class LyLine {
+        double start; double end = -1; String text;
+        List<double[]> ws; List<String> wt; // 단어 시작/끝(초), 단어 텍스트
+    }
+
+    private static double parseStamp(String mm, String ss, String frac) {
+        // 2자리 = 1/100초, 3자리 = 1/1000초
+        double ms = frac.length() == 2
+                ? Integer.parseInt(frac) / 100.0
+                : Integer.parseInt(frac) / 1000.0;
+        return Integer.parseInt(mm) * 60.0 + Integer.parseInt(ss) + ms;
+    }
+
+    /** LRC 파서 — [mm:ss.xx] / [mm:ss.xxx] + Enhanced LRC(<mm:ss.xx> 단어 태그) 지원 */
     private JSONArray parseLrc(String lrc) throws JSONException {
-        List<double[]> times = new ArrayList<>();
-        List<String>   texts = new ArrayList<>();
+        List<LyLine> out = new ArrayList<>();
 
         for (String line : lrc.split("\n")) {
             String trimmed = line.trim();
@@ -932,39 +977,197 @@ public class MainActivity extends AppCompatActivity {
             if (textPart.isEmpty() || CREDIT_RX.matcher(textPart).matches())
                 continue;
 
+            // Enhanced LRC: <mm:ss.xx> 단어 태그 → 단어(구)별 타이밍 분해
+            List<Double> wTimes = new ArrayList<>();
+            List<String> wTexts = new ArrayList<>();
+            String cleanText = textPart;
+            Matcher wm = WTAG_RX.matcher(textPart);
+            if (wm.find()) {
+                StringBuilder pre = new StringBuilder(textPart.substring(0, wm.start()));
+                wTimes.add(parseStamp(wm.group(1), wm.group(2), wm.group(3)));
+                int segStart = wm.end();
+                while (wm.find()) {
+                    wTexts.add(textPart.substring(segStart, wm.start()));
+                    wTimes.add(parseStamp(wm.group(1), wm.group(2), wm.group(3)));
+                    segStart = wm.end();
+                }
+                wTexts.add(textPart.substring(segStart));
+                for (String s : wTexts) pre.append(s);
+                cleanText = pre.toString().trim();
+            }
+            if (cleanText.isEmpty()) continue;
+
             // 한 줄에 타임스탬프 여러 개 처리
             // 예: [00:12.34][00:45.67]가사텍스트
             Matcher scanner = TS_RX.matcher(trimmed);
             while (scanner.find()) {
-                String msStr = scanner.group(3);
-                // 2자리 = 1/100초, 3자리 = 1/1000초
-                double ms = msStr.length() == 2
-                        ? Integer.parseInt(msStr) / 100.0
-                        : Integer.parseInt(msStr) / 1000.0;
-                double t = Integer.parseInt(scanner.group(1)) * 60.0
-                         + Integer.parseInt(scanner.group(2)) + ms;
-                times.add(new double[]{t});
-                texts.add(textPart);
+                LyLine L = new LyLine();
+                L.start = parseStamp(scanner.group(1), scanner.group(2), scanner.group(3));
+                L.text = cleanText;
+                if (wTimes.size() >= 2) {
+                    L.ws = new ArrayList<>();
+                    L.wt = new ArrayList<>();
+                    for (int i = 0; i < wTimes.size(); i++) {
+                        L.ws.add(new double[]{ wTimes.get(i), -1 });
+                        L.wt.add(wTexts.get(i));
+                    }
+                }
+                out.add(L);
             }
         }
+        return lyToResult(out);
+    }
 
-        // 시간순 정렬
-        Integer[] idx = new Integer[times.size()];
+    // ══════════════════════════════════════════════════
+    //  Lyricsfile(YAML) 파서 — LRCLIB word-sync 전용
+    //  (사양 부분집합: lines/text/start_ms/end_ms/words)
+    // ══════════════════════════════════════════════════
+    private JSONArray parseLyricsfile(String yaml) {
+        if (yaml == null || yaml.isEmpty()) return null;
+        try {
+            List<LyLine> out = new ArrayList<>();
+            LyLine cur = null;
+            boolean inLines = false, inWords = false;
+            for (String raw : yaml.split("\n")) {
+                int ind = 0;
+                while (ind < raw.length() && raw.charAt(ind) == ' ') ind++;
+                String t = raw.trim();
+                if (t.isEmpty() || t.startsWith("#") || t.startsWith("---")) continue;
+                if (ind == 0) {
+                    inLines = t.startsWith("lines:");
+                    inWords = false;
+                    cur = null;
+                    continue;
+                }
+                if (!inLines) continue;
+                if (ind <= 2 && t.startsWith("- ")) {
+                    cur = new LyLine();
+                    out.add(cur);
+                    inWords = false;
+                    applyYamlField(cur, -1, t.substring(2).trim());
+                } else if (ind == 4 && t.startsWith("words:")) {
+                    inWords = true;
+                } else if (ind == 4) {
+                    inWords = false;
+                    if (cur != null) applyYamlField(cur, -1, t);
+                } else if (inWords && ind >= 6 && t.startsWith("- ")) {
+                    if (cur != null) {
+                        if (cur.ws == null) { cur.ws = new ArrayList<>(); cur.wt = new ArrayList<>(); }
+                        cur.ws.add(new double[]{ 0, -1 });
+                        cur.wt.add("");
+                        applyYamlField(cur, cur.ws.size() - 1, t.substring(2).trim());
+                    }
+                } else if (inWords && ind >= 8 && cur != null && cur.ws != null && !cur.ws.isEmpty()) {
+                    applyYamlField(cur, cur.ws.size() - 1, t);
+                }
+            }
+            return lyToResult(out);
+        } catch (Exception e) { return null; }
+    }
+
+    private void applyYamlField(LyLine L, int wi, String kv) {
+        int c = kv.indexOf(':');
+        if (c <= 0) return;
+        String key = kv.substring(0, c).trim();
+        String val = yamlScalar(kv.substring(c + 1).trim());
+        if (wi < 0) {
+            switch (key) {
+                case "text":     L.text = val; break;
+                case "start_ms": L.start = yamlSec(val); break;
+                case "end_ms":   L.end   = yamlSec(val); break;
+            }
+        } else if (wi < L.ws.size()) {
+            double[] w = L.ws.get(wi);
+            switch (key) {
+                case "text":     L.wt.set(wi, val); break;
+                case "start_ms": w[0] = yamlSec(val); break;
+                case "end_ms":   w[1] = yamlSec(val); break;
+            }
+        }
+    }
+
+    private static double yamlSec(String v) {
+        try { return Long.parseLong(v) / 1000.0; } catch (Exception e) { return 0; }
+    }
+
+    private static String yamlScalar(String v) {
+        if (v.length() >= 2 && v.charAt(0) == '\'' && v.charAt(v.length() - 1) == '\'')
+            return v.substring(1, v.length() - 1).replace("''", "'");
+        if (v.length() >= 2 && v.charAt(0) == '"' && v.charAt(v.length() - 1) == '"')
+            return v.substring(1, v.length() - 1).replace("\\\"", "\"");
+        return v;
+    }
+
+    // ══════════════════════════════════════════════════
+    //  NetEase YRC(逐字/word-level) 파서
+    //  [lineStart,lineDur](wordStart,wordDur,0)word ...
+    // ══════════════════════════════════════════════════
+    private JSONArray parseYrc(String yrc) {
+        try {
+            List<LyLine> out = new ArrayList<>();
+            for (String raw : yrc.split("\n")) {
+                String line = raw.trim();
+                Matcher lm = YRC_LINE_RX.matcher(line);
+                if (!lm.find()) continue;
+                LyLine L = new LyLine();
+                L.start = Long.parseLong(lm.group(1)) / 1000.0;
+                L.end = L.start + Long.parseLong(lm.group(2)) / 1000.0;
+                L.ws = new ArrayList<>();
+                L.wt = new ArrayList<>();
+                StringBuilder sb = new StringBuilder();
+                Matcher wm = YRC_WORD_RX.matcher(line.substring(lm.end()));
+                while (wm.find()) {
+                    String wt = wm.group(3);
+                    if (wt.isEmpty()) continue;
+                    double ws = Long.parseLong(wm.group(1)) / 1000.0;
+                    L.ws.add(new double[]{ ws, ws + Long.parseLong(wm.group(2)) / 1000.0 });
+                    L.wt.add(wt);
+                    sb.append(wt);
+                }
+                if (L.ws.size() < 2) continue;
+                L.text = sb.toString().trim();
+                if (L.text.isEmpty()) continue;
+                out.add(L);
+            }
+            return out.isEmpty() ? null : lyToResult(out);
+        } catch (Exception e) { return null; }
+    }
+
+    /** 공통 마무리 — 정렬, 줄 끝 계산, words(JSON: s/e/t, 초 단위) 구성 */
+    private JSONArray lyToResult(List<LyLine> in) throws JSONException {
+        Integer[] idx = new Integer[in.size()];
         for (int i = 0; i < idx.length; i++) idx[i] = i;
-        Arrays.sort(idx, (a, b) ->
-                Double.compare(times.get(a)[0], times.get(b)[0]));
+        Arrays.sort(idx, (a, b) -> Double.compare(in.get(a).start, in.get(b).start));
 
         JSONArray result = new JSONArray();
         for (int i = 0; i < idx.length; i++) {
-            int    ci    = idx[i];
-            double start = times.get(ci)[0];
-            double end   = (i + 1 < idx.length)
-                    ? times.get(idx[i + 1])[0] : start + 5.0;
+            LyLine L = in.get(idx[i]);
+            if (L.text == null || L.text.isEmpty()) continue;
+            double start = L.start;
+            double end = (i + 1 < idx.length) ? in.get(idx[i + 1]).start : start + 5.0;
+            if (L.end > start && L.end < end) end = L.end;
             if (end - start < 0.1) end = start + 0.5; // 최소 간격 보장
             JSONObject obj = new JSONObject();
             obj.put("start", start);
             obj.put("end",   end);
-            obj.put("text",  texts.get(ci));
+            obj.put("text",  L.text);
+            if (L.ws != null && L.ws.size() >= 2 && L.wt != null) {
+                JSONArray words = new JSONArray();
+                for (int j = 0; j < L.ws.size(); j++) {
+                    double ws = L.ws.get(j)[0], we = L.ws.get(j)[1];
+                    if (we <= ws) we = (j + 1 < L.ws.size()) ? L.ws.get(j + 1)[0] : end;
+                    if (we <= ws) we = ws + 0.25;
+                    if (ws < start) ws = start;
+                    if (we > end) we = end;
+                    if (we <= ws) continue;
+                    JSONObject w = new JSONObject();
+                    w.put("s", ws);
+                    w.put("e", we);
+                    w.put("t", L.wt.get(j));
+                    words.put(w);
+                }
+                if (words.length() >= 2) obj.put("words", words);
+            }
             result.put(obj);
         }
         return result;

@@ -637,8 +637,9 @@ function renderParticles() {
     const canvas = document.getElementById('np-particles');
     if (!canvas || !document.getElementById('np').classList.contains('on')) return;
     const ctx = canvas.getContext('2d');
-    canvas.width = canvas.offsetWidth || innerWidth;
-    canvas.height = canvas.offsetHeight || innerHeight;
+    // 크기가 그대로면 backing store 재할당 금지 (매 프레임 canvas.width 대입은 GPU 메모리 재할당·발열의 원인)
+    const pw = canvas.offsetWidth || innerWidth, ph = canvas.offsetHeight || innerHeight;
+    if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph; }
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     for (let i = NP_PARTICLES.length - 1; i >= 0; i--) {
         const p = NP_PARTICLES[i];
@@ -707,17 +708,21 @@ function updateNpColor() {
         else _lerpMeshColors();
         const pulse = document.getElementById('np-pulse');
         if (pulse) {
-            pulse.style.background = glow;
-            pulse.style.display = 'block';
+            // 값이 그대로면 style 기록 생략 (50ms 틱마다 반복 기록하던 비용 제거)
+            if (pulse._pbg !== glow) { pulse._pbg = glow; pulse.style.background = glow; }
+            if (pulse._pdisp !== 'block') { pulse._pdisp = 'block'; pulse.style.display = 'block'; }
             if (beat > .08) {
                 const sc2 = 1 + beat * .8 * en;
-                pulse.style.transform = `translateX(-50%) scaleX(${sc2.toFixed(3)})`;
-                pulse.style.opacity = (.5 + beat * .5).toFixed(3);
-                pulse.style.filter = `blur(${8 + beat * 8 * en}px)`;
-            } else {
-                pulse.style.transform = 'translateX(-50%) scaleX(1)';
-                pulse.style.opacity = '.7';
-                pulse.style.filter = 'blur(9px)';
+                const t = `translateX(-50%) scaleX(${sc2.toFixed(3)})`;
+                const o = (.5 + beat * .5).toFixed(3);
+                const f = `blur(${8 + beat * 8 * en}px)`;
+                if (pulse._ptr !== t) { pulse._ptr = t; pulse.style.transform = t; }
+                if (pulse._pop !== o) { pulse._pop = o; pulse.style.opacity = o; }
+                if (pulse._pfil !== f) { pulse._pfil = f; pulse.style.filter = f; }
+            } else if (pulse._pop !== '.7') {
+                pulse._ptr = 'translateX(-50%) scaleX(1)'; pulse.style.transform = pulse._ptr;
+                pulse._pop = '.7'; pulse.style.opacity = '.7';
+                pulse._pfil = 'blur(9px)'; pulse.style.filter = 'blur(9px)';
             }
         }
         const npTitle = document.getElementById('np-title');
@@ -950,10 +955,33 @@ function normalizeLyricLines(lines) {
         const start = +l.start;
         let end = l.end != null ? +l.end : NaN;
         if (isNaN(end) || end <= start) end = start + 4;
-        return { start, end, text: String(l.text || '').trim() };
+        const o = { start, end, text: String(l.text || '').trim() };
+        // word-level(단어 동기화) 보존
+        if (Array.isArray(l.words) && l.words.length >= 2) {
+            const ws = [];
+            for (const w of l.words) {
+                const s = +w.s, e = +w.e, t = String(w.t ?? '');
+                if (isFinite(s) && t) ws.push({ s, e: isFinite(e) ? e : NaN, t });
+            }
+            if (ws.length >= 2) {
+                ws.sort((a, b) => a.s - b.s);
+                for (const w of ws) if (!isFinite(w.e) || w.e <= w.s) w.e = w.s + 0.35;
+                o.words = ws;
+            }
+        }
+        return o;
     }).filter(l => l.text && !isNaN(l.start));
     for (let i = 0; i < out.length - 1; i++) {
         if (out[i].end > out[i + 1].start) out[i].end = out[i + 1].start;
+    }
+    for (const l of out) {
+        if (!l.words) continue;
+        for (const w of l.words) {
+            if (w.s < l.start) w.s = l.start;
+            if (w.e > l.end) w.e = l.end;
+        }
+        l._plan = _wsBuildPlan(l);
+        if (!l._plan) delete l.words;
     }
     return out;
 }
@@ -2208,17 +2236,16 @@ function _renderLsLyrics() {
         const el = document.createElement('div');
         el.className = 'np-ls-lyric-line';
         el.style.cssText = [
-            'font-size:clamp(16px,2.2vw,24px)',
+            'font-size:clamp(17px,2.4vw,25px)',
             'font-weight:700',
             'line-height:1.55',
             'color:rgba(255,255,255,0.00)',
             'padding:6px 0',
             'cursor:pointer',
             'word-break:keep-all',
-            'overflow-wrap:break-word',
-            'will-change:color,filter'
+            'overflow-wrap:break-word'
         ].join(';');
-        el.textContent = line.text;
+        _wsFillLine(el, line, 'el_ls');
         el.addEventListener('click', e => seekToLyric(line.start + 0.05, e));
         inner.appendChild(el);
         LY.lines[i].el_ls = el;
@@ -2271,7 +2298,10 @@ function _syncLsLyrics() {
                 break;
             }
         }
-        if (found === NP_LS.curIdx) return;
+        if (found === NP_LS.curIdx) {
+            if (found >= 0 && LY.lines[found]._plan && S.playing) _wsKick();
+            return;
+        }
         NP_LS.curIdx = found;
         _highlightLsLine(found);
     } catch(e) {}
@@ -2279,41 +2309,49 @@ function _syncLsLyrics() {
 
 function _highlightLsLine(idx) {
     const scroll = document.getElementById('np-ls-scroll');
+    _wsLineChanged('el_ls', idx);
     LY.lines.forEach((line, i) => {
         if (!line.el_ls) return;
         const el = line.el_ls;
         const d = idx < 0 ? 999 : i - idx;
-        el.classList.remove('ls-active', 'ls-prev', 'ls-near');
+        el.classList.remove('ls-active', 'ls-prev', 'ls-near', 'past');
+        if (idx >= 0 && d < 0) el.classList.add('past');   // 지나간 줄: 채워진 채 유지
         if (d === 0) {
             el.style.color      = 'rgba(255,255,255,0.97)';
             el.style.fontWeight = '800';
             el.style.filter     = 'drop-shadow(0 0 16px rgba(255,255,255,0.16))';
             el.classList.add('ls-active');
+            el.style.setProperty('--lw', '0.97'); el.style.setProperty('--ld', '0.32');
         } else if (d === -1) {
             el.style.color      = 'rgba(255,255,255,0.52)';
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
             el.classList.add('ls-prev');
+            el.style.setProperty('--lw', '0.52'); el.style.setProperty('--ld', '0.28');
         } else if (d === -2) {
             el.style.color      = 'rgba(255,255,255,0.18)';
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
             el.classList.add('ls-near');
+            el.style.setProperty('--lw', '0.18'); el.style.setProperty('--ld', '0.18');
         } else if (d === 1) {
             el.style.color      = 'rgba(255,255,255,0.30)';
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
             el.classList.add('ls-near');
+            el.style.setProperty('--lw', '0.30'); el.style.setProperty('--ld', '0.30');
         } else if (d === 2) {
             el.style.color      = 'rgba(255,255,255,0.14)';
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
             el.classList.add('ls-near');
+            el.style.setProperty('--lw', '0.14'); el.style.setProperty('--ld', '0.14');
         } else {
             /* 범위 밖 줄: 완전 투명 → 5줄 밖은 안 보임 */
             el.style.color      = 'rgba(255,255,255,0.00)';
             el.style.fontWeight = '700';
             el.style.filter     = 'none';
+            el.style.setProperty('--lw', '0'); el.style.setProperty('--ld', '0');
         }
     });
     if (idx >= 0 && LY.lines[idx]?.el_ls && scroll) {
@@ -2329,6 +2367,7 @@ function _highlightLsLine(idx) {
             _applyLineSpread('el_ls', idx, Math.max(-20, Math.min(20, vel * -0.055)));
         });
     }
+    _wsSyncNow('el_ls', idx);
 }
 
 /* ════════════════════════════════════════════
@@ -3240,6 +3279,163 @@ const LY = {
     _dotElFs: null
 };
 
+/* ══════════════════════════════════════════════
+   WORD-SYNC — Apple Music 스타일 실시간 단어 하이라이팅
+   - 각 줄을 단어/글자 span 으로 한 번만 만들고, 이후에는 CSS 변수
+     --p(0→1 채움 진행)만 갱신한다 (DOM 재생성/스타일 전체 재기록 없음)
+   - 글자 내부를 빛이 흐르듯 채우는 그라디언트 클립 + 채워짐에 따라
+     한 글자씩 살짝 들어올리는 모션 + 긴 구간에서의 점진적 글로우
+   - 다음 단어 첫 글자에 미리 살짝 채움(bleed) → 기계적 단어 전환이 아닌
+     리듬에 반응하는 자연스러운 흐름
+   - 활성 줄의 "채워지는 중"인 글자에만 기록하므로 재생 시간이 길어져도
+     비용이 늘지 않는다 (FPS/발열 최적화)
+══════════════════════════════════════════════ */
+const _wsOK = (() => {
+    try {
+        return typeof CSS !== 'undefined' && !!CSS.supports &&
+            (CSS.supports('background-clip', 'text') || CSS.supports('-webkit-background-clip', 'text'));
+    } catch (e) { return false; }
+})();
+const _wsSeg = (typeof Intl !== 'undefined' && Intl.Segmenter)
+    ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+function _wsGraphemes(s) {
+    if (_wsSeg) { const out = []; for (const x of _wsSeg.segment(s)) out.push(x.segment); return out; }
+    return Array.from(s);
+}
+const _WS_Q = 16;   // 채움 정량화 단계 (기록 횟수 상한 → 스타일 갱신 최소화)
+
+/* 단어 타이밍 + 줄 텍스트 정렬 → 애니메이션 타임라인 계획(공유) */
+function _wsBuildPlan(line) {
+    if (!_wsOK || !line.words || line.words.length < 2) return null;
+    const text = line.text, segs = [];
+    let cur = 0, prevEnd = line.start;
+    const pushGap = (txt, a, b) => {
+        if (!txt) return;
+        if (b <= a) b = a + 0.06;
+        const gs = _wsGraphemes(txt);
+        segs.push({ gap: true, glow: false, dom: {}, lets: gs.map(t => ({ t, a, b })) });
+    };
+    for (let i = 0; i < line.words.length; i++) {
+        const w = line.words[i];
+        let idx = text.indexOf(w.t, cur), wt = w.t;
+        if (idx < 0) {
+            const t2 = w.t.trim();
+            if (!t2) continue;
+            idx = text.indexOf(t2, cur);
+            if (idx < 0) return null;   // 정렬 불가 → 기본(줄 단위) 가사로
+            wt = t2;
+        }
+        if (idx > cur) pushGap(text.slice(cur, idx), prevEnd, w.s);
+        const nextS = (i + 1 < line.words.length) ? line.words[i + 1].s : line.end;
+        const span = Math.max(0.08, (w.e > w.s ? w.e - w.s : 0) || Math.max(0.25, nextS - w.s));
+        const gs = _wsGraphemes(wt);
+        const n = gs.length;
+        // 오래 머무는 구간(다음 단어까지 간격이 길거나 발음이 긴 단어) → 글로우
+        const glow = (nextS - w.s) > 0.95 || (w.e - w.s) > 1.1;
+        const lets = [];
+        for (let k = 0; k < n; k++) {
+            const a0 = w.s + span * k / n;
+            const b0 = w.s + span * (k + 1) / n;
+            // bleed: 다음 단어 첫 글자에 미리 아주 조금 채워짐 (기계적 전환 방지)
+            const a = (k === 0 && i > 0) ? a0 - Math.min(0.12, (b0 - a0) * 0.28) : a0;
+            lets.push({ t: gs[k], a, b: b0 });
+        }
+        segs.push({ gap: false, glow, dom: {}, lets });
+        cur = idx + wt.length;
+        prevEnd = Math.max(prevEnd, w.e);
+    }
+    if (cur < text.length) pushGap(text.slice(cur), prevEnd, prevEnd + 0.18);
+    return segs.length ? { segs } : null;
+}
+
+/* 가사 줄 DOM 구성 (surface: 'el' | 'el_ls' | 'el_lv') */
+function _wsFillLine(el, line, key) {
+    if (!line._plan) { el.textContent = line.text; return; }
+    el.textContent = '';
+    const segs = line._plan.segs;
+    for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        const wrap = document.createElement('span');
+        wrap.className = seg.gap ? 'lyg' : 'lyw';
+        const dom = seg.dom[key] = [];
+        for (const L of seg.lets) {
+            const s = document.createElement('span');
+            s.className = seg.glow ? 'lyl gl' : 'lyl';
+            s.textContent = L.t;
+            wrap.appendChild(s);
+            dom.push(s);
+        }
+        el.appendChild(wrap);
+        if (i < segs.length - 1) el.appendChild(document.createElement('wbr'));
+    }
+}
+
+/* 현재 시각 기준 채움 진행 — 변경된 글자에만 기록 */
+function _wsTick(cur, key, idx) {
+    const line = LY.lines[idx];
+    if (!line || !line._plan) return;
+    const segs = line._plan.segs;
+    for (let i = 0; i < segs.length; i++) {
+        const dom = segs[i].dom[key];
+        if (!dom) continue;
+        const lets = segs[i].lets;
+        for (let k = 0; k < dom.length; k++) {
+            const el = dom[k], L = lets[k];
+            let p = (cur - L.a) / (L.b - L.a);
+            p = p <= 0 ? 0 : p >= 1 ? 1 : p;
+            const q = Math.round(p * _WS_Q);
+            if (el._q === q) continue;
+            el._q = q;
+            el.style.setProperty('--p', (q / _WS_Q).toFixed(3));
+        }
+    }
+    _wsKick();
+}
+
+/* 줄 전환: 이전 줄의 인라인 --p 를 제거해 CSS 상태(.past/.prev 채움 유지)로 넘긴다 */
+function _wsDetach(key, line) {
+    if (!line || !line._plan) return;
+    const segs = line._plan.segs;
+    for (let i = 0; i < segs.length; i++) {
+        const dom = segs[i].dom[key];
+        if (!dom) continue;
+        for (const el of dom) {
+            if (el._q === undefined) continue;
+            el._q = undefined;
+            el.style.removeProperty('--p');
+        }
+    }
+}
+
+/* 부드러운 채움을 위한 보조 rAF (30fps 상한, 활성 단어 줄 + 재생 중에만) */
+let _wsRaf = 0, _wsLast = 0;
+function _wsKick() {
+    if (!_wsRaf && !window.__bgMode && S.playing) _wsRaf = requestAnimationFrame(_wsLoop);
+}
+function _wsLoop(now) {
+    _wsRaf = 0;
+    if (window.__bgMode) return;
+    const key = LV.active ? 'el_lv' : (NP_LS.active ? 'el_ls' : 'el');
+    const idx = key === 'el_ls' ? NP_LS.curIdx : LY.curIdx;
+    const line = idx >= 0 ? LY.lines[idx] : null;
+    // 가사가 화면에 보이지 않으면(NP 닫힘 등) 즉시 중단 — 숨겨진 DOM 갱신/오디오 타임 질의 방지
+    if (!S.playing || !line || !line._plan) return;
+    if (!NP_LS.active && !LV.active && !_npIsOpen()) return;
+    if (now - _wsLast >= 32) { _wsLast = now; _wsTick(getPlayheadTime(), key, idx); }
+    else _wsKick();
+}
+
+/* 줄 전환 시 상태 이관 + 즉시 위치 동기화 (highlight 함수들이 호출) */
+const _hlW = { el: -1, el_lv: -1, el_ls: -1 };
+function _wsLineChanged(key, idx) {
+    if (_hlW[key] === idx) return;
+    _wsDetach(key, LY.lines[_hlW[key]]);
+    _hlW[key] = idx;
+}
+function _wsSyncNow(key, idx) {
+    if (idx >= 0 && LY.lines[idx]?._plan) _wsTick(getPlayheadTime(), key, idx);
+}
+
 /* ── Focus-driven Inertial Spring 유틸 ──────────────────────────
    CSS transition(고정 duration)을 쓰지 않고, 매 프레임 질량-스프링-감쇠
    물리로 목표 위치를 향해 실시간 보간한다.
@@ -3529,7 +3725,7 @@ function _renderLyrics() {
     LY.lines.forEach((line, i) => {
         const el = document.createElement('div');
         el.className = 'np-lyric-line';
-        el.textContent = line.text;
+        _wsFillLine(el, line, 'el');
         el.addEventListener('click', e => seekToLyric(line.start + 0.05, e));
         inner.appendChild(el);
         LY.lines[i].el = el;
@@ -3602,6 +3798,7 @@ function _clearLyrics() {
     LY.curIdx = -1;
     LY.videoId = null;
     LY._fetching = null;
+    _hlW.el = _hlW.el_lv = _hlW.el_ls = -1;
     // 랜드스케이프 가사도 초기화
     if (NP_LS.active) {
         NP_LS.curIdx = -1;
@@ -3670,7 +3867,7 @@ function _renderLvLyrics() {
         wrap.className = 'np-lv-line-wrap';
         const main = document.createElement('div');
         main.className = 'np-lyric-line np-lv-line';
-        main.textContent = line.text;
+        _wsFillLine(main, line, 'el_lv');
         wrap.appendChild(main);
         wrap.addEventListener('click', e => seekToLyric(line.start + 0.05, e));
         inner.appendChild(wrap);
@@ -3695,15 +3892,17 @@ function _renderLvLyrics() {
 
 function _highlightLvLine(idx, instant) {
     if (!LY.lines.length) return;
+    _wsLineChanged('el_lv', idx);
     LY.lines.forEach((line, i) => {
         if (!line.el_lv_wrap) return;
-        line.el_lv_wrap.classList.remove('active', 'prev', 'near');
-        line.el_lv?.classList.remove('active', 'prev', 'near');
+        line.el_lv_wrap.classList.remove('active', 'prev', 'near', 'past');
+        line.el_lv?.classList.remove('active', 'prev', 'near', 'past');
         if (idx < 0) return;
         const d = i - idx;
         let cls = null;
         if (d === 0) cls = 'active';
         else if (d === -1) cls = 'prev';
+        else if (d <= -2) cls = 'past';
         else if (d >= 1 && d <= 3) cls = 'near';
         if (cls) {
             line.el_lv_wrap.classList.add(cls);
@@ -3726,6 +3925,7 @@ function _highlightLvLine(idx, instant) {
         if (instant) LY._lvScrollSpring.jump(target, applyFrame);
         else if (!scroll._browsing) LY._lvScrollSpring.to(target, applyFrame);
     }
+    _wsSyncNow('el_lv', idx);
 }
 
 /* ── 자동 가사 번역 (API 키 없이 쓸 수 있는 구글 번역 비공식 엔드포인트) ──
@@ -3767,7 +3967,11 @@ async function _translateLyricsIfNeeded() {
             const text = LY.lines[i].text;
             let tr = _trCache.get(text);
             if (tr === undefined) {
-                try { tr = await _translateText(text); _trCache.set(text, tr); }
+                try {
+                    tr = await _translateText(text);
+                    if (_trCache.size > 600) _trCache.delete(_trCache.keys().next().value);  // 무한 성장 방지
+                    _trCache.set(text, tr);
+                }
                 catch { tr = null; }
             }
             if (LY.videoId !== videoId) return;
@@ -4094,7 +4298,11 @@ function _syncLyrics() {
             break;
         }
     }
-    if (found === LY.curIdx) return;
+    if (found === LY.curIdx) {
+        // 단어 하이라이팅은 보조 rAF가 이어간다 (재생 중에만 활성화)
+        if (found >= 0 && LY.lines[found]._plan && S.playing) _wsKick();
+        return;
+    }
     LY.curIdx = found;
     _highlightLine(found);
 }
@@ -4139,6 +4347,7 @@ function _hideFsDots() {
 }
 
 function _highlightLine(idx, instant) {
+    _wsLineChanged('el', idx);
     if (LV.active) _highlightLvLine(idx, instant);
     if (document.getElementById('np')?.classList.contains('fullscreen')) {
         _highlightFsLine(idx);
@@ -4146,11 +4355,12 @@ function _highlightLine(idx, instant) {
     }
     LY.lines.forEach((line, i) => {
         if (!line.el) return;
-        line.el.classList.remove('active', 'prev', 'near');
+        line.el.classList.remove('active', 'prev', 'near', 'past');
         if (idx < 0) return;
         const d = i - idx;
         if (d === 0) line.el.classList.add('active');
         else if (d === -1) line.el.classList.add('prev');
+        else if (d <= -2) line.el.classList.add('past');
         else if (d >= 1 && d <= 3) line.el.classList.add('near');
     });
     if (idx >= 0 && LY.lines[idx]?.el) {
@@ -4177,6 +4387,7 @@ function _highlightLine(idx, instant) {
             LY._scrollSpring.to(target, applyFrame);
         }
     }
+    _wsSyncNow('el', idx);
 }
 
 /* ════════════════════════════════════════════
